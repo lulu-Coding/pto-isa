@@ -39,24 +39,61 @@ PTO_INTERNAL void AddOneCmoSqe(
     sqe += (sqTail % channelInfo->sq_depth);
 
 #ifdef PTO_NPU_ARCH_A5
+    // Fully initialize the STARS v2 CMO SQE: the SQ ring lives in aclrtMalloc'd
+    // device memory with unspecified contents, so every field the hardware
+    // parses must be written. Mirrors SHMEM aclshmemi_fill_stars_v2_cmo_sqe
+    // (hardware-verified on Ascend950, SHMEM PR #459).
     sqe->type = RT_STARS_SQE_TYPE_SDMA;
-    sqe->wrCqe = 1;
-    sqe->numBlocks = 0;
+    sqe->lock = 0U;
+    sqe->unlock = 0U;
+    sqe->ie = 0U;
+    sqe->preP = 0U;
+    sqe->postP = 0U;
+    sqe->wrCqe = 1U;
+    sqe->ptrMode = 0U;
+    sqe->rttMode = 0U;
+    sqe->headUpdate = 0U;
+    sqe->reserved0 = 0U;
+    sqe->numBlocks = 0U;
     sqe->rtStreamId = channelInfo->stream_id;
-    sqe->taskId = taskId;
+    // task_id is derived from SQ tail/head distance and is bounded by SQ depth.
+    sqe->taskId = static_cast<uint16_t>(taskId);
+    sqe->res1 = 0U;
+    sqe->res2 = 0U;
     sqe->kernelCredit = K_CREDIT_TIME_DEFAULT;
+    sqe->res3 = 0U;
     sqe->opcode = kCmoPrefetchOpcode;
     sqe->sssv = 1U;
     sqe->dssv = 1U;
     sqe->sns = 1U;
     sqe->dns = 1U;
-    sqe->lengthMove = length;
+    sqe->sro = 0U;
+    sqe->dro = 0U;
+    sqe->stride = 0U;
+    sqe->ie2 = 0U;
+    sqe->compEn = 0U;
+    sqe->res4 = 0U;
+    sqe->sqeId = 0U;
+    sqe->mapamPartId = 0U;
+    sqe->mpamns = 0U;
+    sqe->pmg = 0U;
+    sqe->qos = 6U; // HCCL QoS (matches SHMEM STARS v2)
+    sqe->d2dOffsetFlag = 0U;
+    sqe->srcStreamId = 0U;
+    sqe->srcSubStreamId = 0U;
+    sqe->dstStreamId = 0U;
+    sqe->dstSubStreamId = 0U;
 
     uint64_t srcAddr = reinterpret_cast<uint64_t>(src);
     sqe->srcAddrLow = static_cast<uint32_t>(srcAddr & 0xFFFFFFFF);
     sqe->srcAddrHigh = static_cast<uint32_t>((srcAddr >> 32) & 0xFFFFFFFF);
     sqe->dstAddrLow = 0U;
     sqe->dstAddrHigh = 0U;
+    sqe->lengthMove = length;
+    sqe->srcOffsetLow = 0U;
+    sqe->dstOffsetLow = 0U;
+    sqe->srcOffsetHigh = 0U;
+    sqe->dstOffsetHigh = 0U;
 #else
     sqe->type = RT_STARS_SQE_TYPE_SDMA;
     sqe->blockDim = 0;
