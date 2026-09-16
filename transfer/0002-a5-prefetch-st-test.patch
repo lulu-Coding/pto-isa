@@ -1,0 +1,24 @@
+diff --git a/tests/st/runtime/ops/test_prefetch_async.py b/tests/st/runtime/ops/test_prefetch_async.py
+index 81bb6033..1960cc70 100644
+--- a/tests/st/runtime/ops/test_prefetch_async.py
++++ b/tests/st/runtime/ops/test_prefetch_async.py
+@@ -19,8 +19,8 @@ actually completes rather than hanging.
+ The generated artifact records that it requires SDMA. Normal compiled-program
+ execution uses that metadata to create an SDMA-enabled worker; the runtime owns
+ and injects the workspace consumed by the generated kernel wrapper. Runtime
+-provisioning is currently covered only on onboard a2a3, so this test deliberately
+-excludes simulator and a5 targets instead of treating either as a no-op path.
++provisioning is covered on onboard a2a3 and a5; simulator provisions an inert
++scratch block so the same kernel contract (non-zero workspace address) holds.
+ """
+ 
+ import pypto.language as pl
+@@ -62,7 +62,7 @@ class PrefetchAsyncProgram:
+         return out
+ 
+ 
+-@pytest.mark.platforms("a2a3")
++@pytest.mark.platforms("a2a3", "a5")
+ class TestPrefetchAsync:
+     """End-to-end async GM->L2 prefetch on device."""
+ 

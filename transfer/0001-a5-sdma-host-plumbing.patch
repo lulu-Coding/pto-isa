@@ -1,0 +1,137 @@
+diff --git a/src/a5/platform/onboard/host/comm_hccl.cpp b/src/a5/platform/onboard/host/comm_hccl.cpp
+index d8cefd20..aac690c0 100644
+--- a/src/a5/platform/onboard/host/comm_hccl.cpp
++++ b/src/a5/platform/onboard/host/comm_hccl.cpp
+@@ -755,26 +755,91 @@ static void ensure_sdma_workspace(CommHandle h) {
+ #endif
+ }
+ 
+-// Callable-declared workspace injection is not available on a5 yet. Its URMA
+-// workspace is sized per communication domain (rank count), not per device;
+-// reject required masks before a callable runs instead of silently launching
+-// it with a null workspace.
+-extern "C" uint32_t dma_workspace_supported_mask(void) { return 0; }
++// Host wrapper owning one SDMA-enabled Worker's provisioned resources. The
++// opaque handle returned to the runner IS this manager; dma_workspace_release()
++// destroys it. There is no per-device generation gate: an SDMA-enabled Worker
++// owns its provider for its whole life and releases it at finalize.
++#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
++using SdmaManager = pto::comm::sdma::SdmaWorkspaceManager;
++#endif
++
++extern "C" uint32_t dma_workspace_supported_mask(void) {
++#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
++    return uint32_t{1} << DMA_WORKSPACE_SDMA;
++#else
++    return 0;
++#endif
++}
+ 
+-// 0 channels: a5 provisions no device-wide SDMA workspace (see above), so there
+-// is nothing for the control-path warmup to walk. Defined anyway because the
+-// shared onboard DeviceRunnerBase references the symbol.
+-extern "C" uint32_t dma_workspace_channel_count(void) { return 0; }
++extern "C" uint32_t dma_workspace_channel_count(void) {
++#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
++    // kSdmaMaxChannelGroups, not the device-side kSdmaMaxChannel: the two are
++    // the same 48 (PTO static_asserts kPostMaxQueues == kSdmaMaxChannelGroups)
++    // but only this one comes in through the host-safe workspace-manager header,
++    // and it is what SdmaWorkspaceManager::Init actually creates streams for.
++    return pto::comm::sdma::kSdmaMaxChannelGroups;
++#else
++    return 0;
++#endif
++}
+ 
+ extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_out, int count, void **handle_out) {
+     if (!addr_out || !handle_out || count < 0) return -1;
+     *handle_out = nullptr;
+     for (int i = 0; i < count; ++i)
+         addr_out[i] = 0;
++    const uint32_t supported = dma_workspace_supported_mask();
++    if ((required_mask & ~supported) != 0) return -1;
++#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
++    if ((required_mask & (uint32_t{1} << DMA_WORKSPACE_SDMA)) == 0) return 0;
++    if (count <= DMA_WORKSPACE_SDMA) return -1;
++    try {
++        auto manager = std::make_unique<SdmaManager>();
++        bool init_ok = false;
++        try {
++            // Init creates the 48 STARS streams + 16KB workspace. It may fail
++            // after creating only a subset; destructing that partial manager on
++            // an error-state card can itself stall, so leak it on failure rather
++            // than risk the stall.
++            init_ok = manager->Init();
++        } catch (...) {
++            LOG_ERROR("SdmaWorkspaceManager::Init threw; abandoning its partial resources");
++        }
++        if (!init_ok) {
++            (void)manager.release();
++            return -1;
++        }
++        const uint64_t addr = reinterpret_cast<uint64_t>(manager->GetWorkspaceAddr());
++        if (addr == 0) {
++            (void)manager.release();
++            LOG_ERROR("dma_workspace_provision: manager returned a null workspace address");
++            return -1;
++        }
++        addr_out[DMA_WORKSPACE_SDMA] = addr;
++        *handle_out = manager.release();
++        return 0;
++    } catch (...) {
++        LOG_ERROR("dma_workspace_provision: exception while provisioning SDMA");
++        return -1;
++    }
++#else
+     return required_mask == 0 ? 0 : -1;
++#endif
+ }
+ 
+-extern "C" void dma_workspace_release(void *handle) { (void)handle; }
++extern "C" void dma_workspace_release(void *handle) {
++#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
++    if (!handle) return;
++    try {
++        std::unique_ptr<SdmaManager> manager(static_cast<SdmaManager *>(handle));
++        manager.reset();
++    } catch (...) {
++        LOG_ERROR("dma_workspace_release: exception while releasing SDMA resources");
++    }
++#else
++    (void)handle;
++#endif
++}
+ 
+ #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+ static uint64_t urma_workspace_bytes(uint32_t rank_count) {
+diff --git a/src/common/platform/include/common/dma_workspace.h b/src/common/platform/include/common/dma_workspace.h
+index fa052b99..981f0c23 100644
+--- a/src/common/platform/include/common/dma_workspace.h
++++ b/src/common/platform/include/common/dma_workspace.h
+@@ -34,15 +34,17 @@
+  * docs/investigations/2026-07-a2a3-sdma-fault-teardown.md. A Worker declines it
+  * by leaving `enable_sdma` off, which is the default.
+  *
+- * Current support matrix: the a2a3 onboard PTO-SDMA provider is compiled into
+- * every a2a3 onboard host_runtime, so both runtimes there provision SDMA on
+- * request — the gate is the platform, not the runtime. Only
+- * tensormap_and_ringbuffer is exercised with it, so host-build-graph's path from
+- * a provisioned address to a kernel's get_dma_workspace is unverified rather
+- * than closed. URMA is reserved for the future a5 per-domain provider.
+- * Simulation, a5, and builds without the a2a3 PTO-SDMA provider reject a request
+- * for SDMA during Worker initialization, when the workspace would be
+- * provisioned.
++ * Current support matrix: the a2a3 and a5 onboard PTO-SDMA providers are
++ * compiled into their respective onboard host_runtime builds, so both
++ * runtimes provision SDMA on request — the gate is the platform, not the
++ * runtime. Only tensormap_and_ringbuffer is exercised with it on a2a3, so
++ * host-build-graph's path from a provisioned address to a kernel's
++ * get_dma_workspace is unverified rather than closed on that runtime; the
++ * a5 provider mirrors the a2a3 implementation but is not yet exercised
++ * end-to-end on hardware. URMA is reserved for the future a5 per-domain
++ * provider. Simulation and builds without the PTO-SDMA provider reject a
++ * request for SDMA during Worker initialization, when the workspace would
++ * be provisioned.
+  */
+ 
+ #ifndef PLATFORM_COMMON_DMA_WORKSPACE_H_
