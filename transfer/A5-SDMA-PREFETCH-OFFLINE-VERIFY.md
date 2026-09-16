@@ -1,6 +1,6 @@
 # A5 SDMA Prefetch 离线环境验证手册
 
-版本：v1.0（2026-09-15）
+版本：v1.1（2026-09-15；v1.1 新增 §2.4 fork 仓下载方式）
 目标：在离线（无外网）950 环境上，端到端验证 AIV SDMA direct-drive prefetch（A5/Ascend950）的代码修改。
 适用：验证人按步骤执行，任何一步不符合"期望"即停止并按第 9 章反馈。
 
@@ -115,6 +115,38 @@ git -C "C:\Users\Administrator\AppData\Local\Temp\opencode\pto-isa-fork" bundle 
 | 本文档 | — |
 
 注意：若 pypto.bundle 体积过大，且离线机已有 pypto 仓（见附录 A），可只带 3 个补丁 + `pto-isa.bundle`。
+
+### 2.4 产物获取：从 GitHub fork 仓直接下载（推荐）
+
+产物已上传至 fork 仓 **`lulu-Coding/pto-isa`** 专用分支 **`offline-verify-transfer`**（`9e2262fb`）的 `transfer/` 目录，与本地母本完全一致（含 `SHA256SUMS` 校验文件）。该分支独立于 `main` 与 `fix/a5-stars-v2-sqe-init`，不影响后续 PR。
+
+**方式一：git clone（一次全下，推荐）**
+
+```bash
+git clone --depth 1 -b offline-verify-transfer https://github.com/lulu-Coding/pto-isa.git pto-isa-transfer
+mkdir -p /data/transfer
+cp pto-isa-transfer/transfer/* /data/transfer/
+cd /data/transfer && sha256sum -c SHA256SUMS
+```
+
+**方式二：wget 单文件（免 git，支持断点续传）**
+
+```bash
+mkdir -p /data/transfer && cd /data/transfer
+base=https://raw.githubusercontent.com/lulu-Coding/pto-isa/offline-verify-transfer/transfer
+for f in 0001-a5-sdma-host-plumbing.patch 0002-a5-prefetch-st-test.patch \
+         0003-fix-a5-sqe.patch A5-SDMA-PREFETCH-OFFLINE-VERIFY.md SHA256SUMS \
+         libbacktrace.bundle msgpack-c.bundle pto-isa.bundle pypto.bundle simpler.bundle; do
+    wget -c $base/$f
+done
+sha256sum -c SHA256SUMS
+```
+
+说明：
+- `sha256sum -c SHA256SUMS` **必须全部 OK** 再继续（防止下载中断/损坏）
+- 若 github.com 访问不稳：clone 方式可挂代理 `git config --global http.proxy http://<proxy>:<port>` 后重试
+- 无外网机器仍走 U 盘/共享盘拷贝 `transfer/` 目录（§2.3 清单）
+- 下载完成后按第 3 章开始，`export TR=/data/transfer`（按实际目录调整）
 
 ---
 
