@@ -40,6 +40,13 @@ extern "C" aclTensor* aclCreateTensor(
     aclFormat format, const int64_t* storageDims, uint64_t storageDimsNum, void* tensorData);
 extern "C" int32_t aclDestroyTensor(const aclTensor* tensor);
 
+// ACL runtime notify API (from acl/acl_rt.h, linked via libruntime.so).
+// Forward-declared to avoid depending on acl/acl_rt.h declaring them
+// (older CANN versions may not expose these in the public header).
+extern "C" int32_t aclrtCreateNotify(void** notify, uint32_t flag);
+extern "C" int32_t aclrtGetNotifyId(void* notify, uint32_t* notifyId);
+extern "C" int32_t aclrtDestroyNotify(void* notify);
+
 namespace pto {
 namespace comm {
 namespace sdma {
@@ -60,6 +67,11 @@ namespace sdma {
 namespace detail {
 
 constexpr uint32_t kSdmaMaxChan = kSdmaMaxChannelGroups;
+
+// STARS v2 (A5) notify-ID region offset within the workspace, matching SHMEM's
+// ACLSHMEM_STARS_NOTIFY_ADDR_OFFSET. The AICPU op aclnnShmemSdmaStarsQuery reads
+// notify IDs from this offset on A5; a2a3 (STARS v1) does not need them.
+constexpr uint32_t kSdmaNotifyAddrOffset = 14U * 1024U;
 
 struct HostStreamInfo {
     uint64_t stream_;
@@ -111,6 +123,8 @@ public:
             return false;
         if (!MallocWorkspace(kSdmaWorkspaceBytes))
             return false;
+        if (!CreateNotifyIds(detail::kSdmaMaxChan))
+            return false;
         if (!CopyOpResToDevice())
             return false;
         if (!LaunchAicpuKernel(reinterpret_cast<uint64_t>(opResDevicePtr_), opResInfo_.workspace_addr))
@@ -141,6 +155,13 @@ public:
             }
         }
         streams_.clear();
+        for (auto& h : notifyHandles_) {
+            if (h) {
+                aclrtDestroyNotify(h);
+                h = nullptr;
+            }
+        }
+        notifyHandles_.clear();
         opResInfo_ = {};
         CloseDynamicLibs();
         inited_ = false;
@@ -154,6 +175,7 @@ private:
     void* opResDevicePtr_{nullptr};
     std::vector<detail::HostStreamInfo> streams_;
     void* streamsDevicePtr_{nullptr};
+    std::vector<void*> notifyHandles_;
 
     void* rtHandle_{nullptr};
     void* opapiHandle_{nullptr};
@@ -410,6 +432,38 @@ private:
             guard.Release();
             return false;
         }
+        return true;
+    }
+
+    // STARS v2 (A5): the AICPU op aclnnShmemSdmaStarsQuery reads notify IDs
+    // from the workspace at kSdmaNotifyAddrOffset (14 KB). SHMEM populates
+    // them before the AICPU call (CreateNotifyIds in device_sdma_transport_manager.cpp).
+    // Without valid notify IDs the AICPU op faults with 507018 on A5.
+    // a2a3 (STARS v1) does not need this step.
+    bool CreateNotifyIds(uint32_t channelNum)
+    {
+        notifyHandles_.resize(channelNum, nullptr);
+        std::vector<uint32_t> notifyIds(channelNum, 0);
+
+        for (uint32_t i = 0; i < channelNum; ++i) {
+            if (aclrtCreateNotify(&notifyHandles_[i], 0) != 0) {
+                std::cerr << "[SDMA] aclrtCreateNotify " << i << " failed" << std::endl;
+                return false;
+            }
+            if (aclrtGetNotifyId(notifyHandles_[i], &notifyIds[i]) != 0) {
+                std::cerr << "[SDMA] aclrtGetNotifyId " << i << " failed" << std::endl;
+                return false;
+            }
+        }
+
+        void* notifyBase = reinterpret_cast<void*>(opResInfo_.workspace_addr + detail::kSdmaNotifyAddrOffset);
+        if (aclrtMemcpy(notifyBase, channelNum * sizeof(uint32_t), notifyIds.data(),
+                        channelNum * sizeof(uint32_t), ACL_MEMCPY_HOST_TO_DEVICE) != 0) {
+            std::cerr << "[SDMA] CreateNotifyIds memcpy failed" << std::endl;
+            return false;
+        }
+
+        std::cerr << "[SDMA] Created " << channelNum << " notify IDs OK" << std::endl;
         return true;
     }
 
